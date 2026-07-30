@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # Preprocessing output (converted NIfTI cohort; may contain patient imaging)
 dataset.csv
@@ -9,3 +10,7 @@ processed/
 # Pipeline artifacts
 trained_models_*/
 cv_folds.csv
+
+# PACS C-FIND series database (contains Study/Series UIDs)
+series_index.csv
+series_find_log.csv

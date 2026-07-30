@@ -154,6 +154,47 @@ Python setup (one time), for the preprocessing step:
 Then invoke the preprocessor with that interpreter, e.g.
    /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py ...
 
+0a. (Optional, PACS only) Inventory what series each study actually contains.
+
+   dataset.csv names one series per patient -- "Series UID (Ax MAGiC)" -- but not
+   what else the study holds. query_series_descriptions.py issues one SERIES-level
+   C-FIND per "Study UID" with dcmtk's findscu and writes every returned series to
+   a CSV. Use it to answer questions like "does this cohort have a post-contrast T1
+   that could serve as the MIST TC channel?" before planning any retrieval.
+
+   It mirrors ../dicomtransfer/batch_cmove.py's command line (same
+   --aet/--aec/--host/--port/--has-header/--study-col/--retries/--retry-wait/
+   --timeout/--log/--dry-run), so query and retrieval are driven the same way.
+
+   Prerequisite: dcmtk is a SYSTEM package, not pip -- "sudo apt install dcmtk"
+   (or pass --findscu /path/to/findscu). pydicom comes from requirements.txt.
+
+     /opt/qmricodes/bin/python3 query_series_descriptions.py dataset.csv --has-header \
+         --aet MYAET --aec REMOTEAEC --host 192.168.1.10 --port 104 --summary
+
+   Useful flags:
+     --dry-run    print the findscu command per study without associating
+     --resume     skip AnonymizationIDs already in --out and append to it
+     --summary    print the UID-free "description -> number of patients" table
+     --out/--log  output paths (defaults series_index.csv / series_find_log.csv)
+
+   Outputs (both gitignored):
+     series_index.csv    AnonymizationID, StudyInstanceUID, SeriesInstanceUID,
+                         SeriesNumber, SeriesDescription, Modality, ProtocolName,
+                         NumberOfSeriesRelatedInstances   -- CONTAINS UIDs
+     series_find_log.csv AnonymizationID, result, n_series, message  -- UID-free
+
+   Only SeriesInstanceUID / SeriesNumber / Modality are guaranteed; the rest are
+   OPTIONAL C-FIND return keys and come back blank if the PACS does not support
+   them (dcmtk's own dcmqrscp, for example, supports only those three at SERIES
+   level). A blank SeriesDescription column for every study means the PACS did
+   not return the attribute -- not that the script failed to parse it.
+
+   PHI: the console prints only AnonymizationID, counts and status; Study/Series
+   UIDs are hidden unless --show-uids is passed (local debugging only -- never
+   paste or commit its output). MRN is never read. series_index.csv necessarily
+   holds UIDs and must stay out of git.
+
 0. Preprocess (run once, before MATLAB), converts DICOM -> processed/<id>/*.nii.gz
    and stamps the acq tags into each NIfTI header:
      /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed
