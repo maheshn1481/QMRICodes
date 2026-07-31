@@ -195,6 +195,45 @@ Then invoke the preprocessor with that interpreter, e.g.
    paste or commit its output). MRN is never read. series_index.csv necessarily
    holds UIDs and must stay out of git.
 
+0b. (Optional, follows 0a) Classify the inventory into imaging series types.
+
+   classify_series_types.py labels every series in series_index.csv by matching
+   its SeriesDescription against an ordered list of regular expressions (a direct
+   port of the R "seriesTypes" list: nonAnat, T13D, AxT1C, T1C, T1, T2star,
+   CubeFLAIR, FLAIR, WandT2, AxT2, OtherT2, DSC, DCE, Trace, eADC, ADC, AvgDC,
+   DWIDTI, FA), then counts how many series of each type each study has.
+
+     /opt/qmricodes/bin/python3 classify_series_types.py series_index.csv
+
+   RULE ORDER IS LOAD-BEARING: each series takes the FIRST rule it matches, which
+   is what separates AxT1C from the more general T1C and T1, and CubeFLAIR from
+   FLAIR. nonAnat is first so scouts/calibrations/functional series are pulled out
+   before any anatomical rule sees them. Use --all-matches to also record every
+   rule a series matched (in an allTypes column) when tuning the patterns.
+
+   Matching is CASE-INSENSITIVE by default: the R patterns mix conventions
+   ("Sag(?!.*REFORMAT).*CUBE.*FL", "probe", "^Exponen"), and real PACS
+   descriptions vary in case, so they only behave as one rule set when case is
+   ignored. Pass --case-sensitive for literal R grepl(perl=TRUE) semantics.
+
+   Other flags:
+     --drop-nonanat          exclude non-anatomical series from the outputs
+     --show-unmatched N      list the N most common unclassified descriptions
+                             (default 20; 0 to suppress) -- this is the feedback
+                             loop for extending the rules
+     --no-protocol-fallback  do not fall back to ProtocolName when the PACS
+                             returned no SeriesDescription for a series
+
+   Outputs (both gitignored):
+     series_types.csv        every series with its seriesType  -- CONTAINS UIDs
+     series_type_counts.csv  AnonymizationID, StudyIndex, n_series, then one
+                             column per type  -- UID-free and MRN-free, so it is
+                             safe to share
+
+   The console also prints a "[gap ]" line per type listing how many studies lack
+   it entirely -- that is the direct answer to "how many patients have no
+   post-contrast T1?" (types AxT1C / T1C).
+
 0. Preprocess (run once, before MATLAB), converts DICOM -> processed/<id>/*.nii.gz
    and stamps the acq tags into each NIfTI header:
      /opt/qmricodes/bin/python3 preprocess_dicom_to_nifti.py --csv dataset.csv --out processed

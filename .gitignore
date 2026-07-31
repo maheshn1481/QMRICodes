@@ -14,3 +14,5 @@ cv_folds.csv
 # PACS C-FIND series database (contains Study/Series UIDs)
 series_index.csv
 series_find_log.csv
+series_types.csv
+series_type_counts.csv
