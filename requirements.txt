@@ -1,0 +1,10 @@
+# Python dependencies for preprocess_dicom_to_nifti.py (DICOM -> NIfTI).
+# Versions are the ones this pipeline was tested with.
+SimpleITK>=2.5.4
+nibabel>=5.4.2
+pydicom>=3.0.2
+pandas>=2.2
+
+# Optional: skull-strip brain masks via skullstrip_hdbet.py (pulls in torch).
+# Install only if you want brain masks:  pip install HD-BET
+# HD-BET

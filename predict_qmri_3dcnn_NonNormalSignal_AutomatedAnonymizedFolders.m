@@ -1,16 +1,18 @@
 % ===============================================================
-% qMRI 3D CNN Inference & Saving
+% qMRI 3D CNN Inference & Saving  (5-fold CV)
 % - Loads trained net + config (choose .mat)
-% - Reads ONE master Excel file from root folder: acq_params.xlsx
-% - Infers LOPO fold from trained model folder name, e.g. trained_models_P1
-% - Maps P1/P2/... to the corresponding patient row order in Excel
-% - Asks whether to predict:
-%       (1) held-out patient only
-%       (2) all patients
-% - Loads T1w/T2w/FLAIR (+ optional mask)
+% - Reads the anonymized MAGiC cohort CSV (schema: doc/fulldataset.md) and the
+%   PHI-free fold manifest cv_folds.csv written by the training script
+% - Infers the CV fold from the trained model folder name: trained_models_Fold<f>
+% - Predicts the held-out patients of that fold (or all patients)
+% - Loads T1w/T2w/FLAIR (+ optional mask), resolved from the CSV rows
 % - Runs sliding-window prediction (GPU if present)
-% - Saves PD/T1/T2/g1/g2/g3 as NIfTI in an identifiable output folder
+% - Saves PD/T1/T2/g1/g2/g3 as NIfTI in <outRoot>/<AnonymizationID>/Fold<f>_Predictions
 % - Synthesizes signals from predictions and saves as NIfTI, too
+%
+% PHI PROTECTION (see ../radpathsandbox/CLAUDE.md): only AnonymizationID is ever
+% printed / used in paths; MRN / Study UID / Series UID are never surfaced; every
+% required input is gated by requireFile() before use.
 % ===============================================================
 
 clc; clear; close all;
@@ -34,82 +36,105 @@ else
     cfgTr = struct();
 end
 
-%% 1) Select root folder containing patient subfolders and master Excel
-rootDir = uigetdir(pwd, 'Select ROOT folder containing acq_params.xlsx and patient folders');
+%% 1) Master config (must match the training script)
+config.idCol     = "AnonymizationID";
+config.csvName   = "dataset.csv";
+config.requireMatched = true;
+config.useRefMaps     = true;     % SYMAPS provides quantitative T1/T2/PD references
+config.predictAll     = false;    % false = held-out fold only; true = all patients
+
+% Acquisition parameters are read per patient from the NIfTI header 'descrip'
+% (stamped by preprocess_dicom_to_nifti.py) by readAcqParams(). config.acq is an
+% OPTIONAL fallback [TRT1 TET1 FAT1_deg TRT2 TET2 TRFLAIR TEFLAIR TIFLAIR]: any
+% positive entry is used only when the header lacks that tag.
+config.acq = [   0,    0,    0,     0,    0,      0,       0,       0 ];   % optional fallback
+
+% Fixed NIfTI basenames under <processedRoot>/<AnonymizationID>/ (produced by
+% preprocess_dicom_to_nifti.py).
+config.fileT1w   = "T1W.nii.gz";
+config.fileT2w   = "T2W.nii.gz";
+config.fileFLAIR = "FLAIR.nii.gz";
+config.filePDref = "PD.nii.gz";
+config.fileT1ref = "T1map.nii.gz";
+config.fileT2ref = "T2map.nii.gz";
+config.fileMask  = "mask.nii.gz";
+
+%% 1.1) Select root folder containing the cohort CSV and fold manifest
+rootDir = uigetdir(pwd, 'Select ROOT folder containing dataset.csv and cv_folds.csv');
 if isequal(rootDir,0)
     error('Root folder selection cancelled.');
 end
+config.rootDir = rootDir;
+config.outRoot = rootDir;     % where <AnonymizationID>/Fold<f>_Predictions are written
+config.processedRoot = fullfile(rootDir, 'processed');   % preprocessor output root
 
-%% 2) Read master Excel file with ALL patients
-excelPath = fullfile(rootDir, 'acq_params.xlsx');
-assert(isfile(excelPath), 'Could not find acq_params.xlsx in root folder: %s', rootDir);
+%% 2) Read cohort CSV and the PHI-free fold manifest
+csvPath = fullfile(rootDir, config.csvName);
+T = readCohortCSV(csvPath, config);
+idCol = config.idCol;
 
-T = readtable(excelPath);
-
-% Resolve expected column names
-idCol   = pickVar(T, ["PatientID","ID","Subject","SubjectID"]);
-TRT1col = pickVar(T, ["TRT1","TR_T1","TR_Gre","TR_SPGR","TR_T1w"]);
-TET1col = pickVar(T, ["TET1","TE_T1","TE_Gre","TE_SPGR","TE_T1w"]);
-FADcol  = pickVar(T, ["FAT1_deg","FA_deg","Flip_deg","FA","FlipAngle_deg"]);
-TRT2col = pickVar(T, ["TRT2","TR_SE","TR_T2","TR_T2w"]);
-TET2col = pickVar(T, ["TET2","TE_SE","TE_T2","TE_T2w"]);
-TRFcol  = pickVar(T, ["TRFLAIR","TR_FLAIR","TR_IR"]);
-TEFcol  = pickVar(T, ["TEFLAIR","TE_FLAIR"]);
-TIFcol  = pickVar(T, ["TIFLAIR","TI","TI_FLAIR"]);
+foldPath = fullfile(rootDir, 'cv_folds.csv');
+assert(isfile(foldPath), 'Fold manifest cv_folds.csv not found in %s (run training first).', rootDir);
+% Read AnonymizationID as text so zero-padded ids match the cohort CSV / folders.
+foldOpts = detectImportOptions(foldPath, 'VariableNamingRule','preserve');
+hitFoldId = find(strcmpi(foldOpts.VariableNames, idCol), 1);
+if ~isempty(hitFoldId)
+    foldOpts = setvartype(foldOpts, foldOpts.VariableNames(hitFoldId), 'char');
+end
+foldTable = readtable(foldPath, foldOpts);
+assert(any(strcmp(foldTable.Properties.VariableNames, char(idCol))), ...
+    'cv_folds.csv missing "%s" column.', idCol);
 
 patientIDs = strtrim(string(T.(idCol)));
 patientIDs = patientIDs(~ismissing(patientIDs) & strlength(patientIDs)>0);
+assert(~isempty(patientIDs), 'No valid patient IDs found in cohort CSV.');
 
-assert(~isempty(patientIDs), 'No valid patient IDs found in Excel.');
-
-%% 3) Detect LOPO fold from trained model folder name
+%% 3) Detect CV fold from trained model folder name
 modelFolder = string(getLastFolderName(matPath));
 
-% Detect model type from selected model folder
 % Accepted folder names:
 %   trained_models_all
-%   trained_models_LeftOut_P0001, trained_models_LeftOut_P0002, ...
-
-tokens = regexp(modelFolder, '^trained_models_LeftOut_(P\d{4})$', 'tokens');
+%   trained_models_Fold1, trained_models_Fold2, ...
+tokens = regexp(modelFolder, '^trained_models_Fold(\d+)$', 'tokens');
 
 if strcmpi(modelFolder, 'trained_models_all')
 
     modelMode = "all";
-    leftOutID = "";
+    foldNum   = 0;
     savedir   = "All_Pred";
+    heldOutIDs = strings(0,1);
 
 elseif ~isempty(tokens)
 
-    modelMode = "lopo";
-    leftOutID = string(tokens{1}{1});   % e.g., "P0001"
+    modelMode = "cv";
+    foldNum   = str2double(tokens{1}{1});     % e.g., 1
 
-    % Check that this left-out patient exists in Excel
-    if ~any(patientIDs == leftOutID)
-        error('Left-out patient %s from model folder was not found in Excel PatientID column.', leftOutID);
+    % Held-out patients for this fold come from the PHI-free manifest.
+    manifestIDs   = strtrim(string(foldTable.(char(idCol))));
+    manifestFolds = double(foldTable.fold);
+    heldOutIDs    = manifestIDs(manifestFolds == foldNum);
+    heldOutIDs    = heldOutIDs(ismember(heldOutIDs, patientIDs));  % present in CSV
+    if isempty(heldOutIDs)
+        error('No held-out patients found for fold %d in cv_folds.csv.', foldNum);
     end
 
-    savedir = leftOutID + "_Left_Predictions";
+    savedir = sprintf('Fold%d_Predictions', foldNum);
 
 else
-    error(['Model folder name must be either trained_models_all ', ...
-        'or trained_models_LeftOut_P0001, trained_models_LeftOut_P0002, etc.']);
+    error(['Model folder name must be trained_models_all or ', ...
+        'trained_models_Fold1, trained_models_Fold2, etc.']);
 end
-%% 3.1) Ask whether to predict held-out patient only or all patients
-% Decide which patients to predict
+
+%% 3.1) Decide which patients to predict
 if modelMode == "all"
     fprintf('Model trained on all patients selected. Predicting all patients.\n');
     predictIDs = patientIDs;
+elseif config.predictAll
+    fprintf('Fold %d model: predicting ALL patients (held-out + in-train).\n', foldNum);
+    predictIDs = patientIDs;
 else
-    choice = questdlg('Which patients do you want to predict?', ...
-        'Prediction mode', ...
-        'Held-out patient only', 'All patients', ...
-        'Held-out patient only');
-
-    if strcmp(choice, 'Held-out patient only')
-        predictIDs = leftOutID;
-    else
-        predictIDs = patientIDs;
-    end
+    fprintf('Fold %d model: predicting %d held-out patients.\n', foldNum, numel(heldOutIDs));
+    predictIDs = heldOutIDs;
 end
 
 
@@ -120,51 +145,40 @@ for sel = 1:numel(predictIDs)
 
     close all
 
-    pid  = predictIDs(sel);
-    pdir = fullfile(rootDir, pid);
-
-    assert(isfolder(pdir), 'Patient folder not found: %s', pdir);
+    pid = predictIDs(sel);
 
     fprintf('\nSelected patient: %s\n', pid);
 
-    if ~exist(fullfile(pdir, savedir), 'dir')
-        mkdir(fullfile(pdir, savedir));
+    % Output goes to <outRoot>/<AnonymizationID>/Fold<f>_Predictions (PHI-safe).
+    savefolder = fullfile(config.outRoot, char(pid), char(savedir));
+    if ~exist(savefolder, 'dir')
+        mkdir(savefolder);
     end
 
-    savefolder = fullfile(pdir, savedir);
+    %% 4) Locate & load patient data (resolve paths from the CSV row)
+    row = T(strcmp(strtrim(string(T.(idCol))), pid), :);
+    assert(~isempty(row),'Patient %s not found in cohort CSV.', pid);
+    row = row(1,:);
+    paths = resolvePatientFiles(row, config);
 
-    %% 4) Locate & load patient data
-    % === File name definitions for this dataset ===
-    config.fileT1w     = "PREOP_T1_W_S.nii.gz";
-    config.fileT2w     = "PREOP_AxT2_W_S.nii.gz";
-    config.fileFLAIR   = "PREOP_FLAIR_W_S.nii.gz";
-    config.filePDref   = "pdmap.nii.gz";
-    config.fileT1ref   = "t1map.nii.gz";
-    config.fileT2ref   = "t2map.nii.gz";
+    S1  = readNii(requireFile(paths.T1w,   pid, 'T1W'));
+    infoRef = niftiinfo(requireFile(paths.T1w, pid, 'T1W'));
+    S2  = readNii(requireFile(paths.T2w,   pid, 'T2W'));
+    S3  = readNii(requireFile(paths.FLAIR, pid, 'FLAIR'));
 
-    % === Locate patient files ===
-    fileT1w   = matchExisting(pdir, [config.fileT1w, erase(config.fileT1w,".gz")]);
-    fileT2w   = matchExisting(pdir, [config.fileT2w, erase(config.fileT2w,".gz")]);
-    fileFLAIR = matchExisting(pdir, [config.fileFLAIR, erase(config.fileFLAIR,".gz")]);
+    if config.useRefMaps
+        PDSyMRI = readNii(requireFile(paths.PDref, pid, 'PDref'));
+        T1SyMRI = readNii(requireFile(paths.T1ref, pid, 'T1ref'));
+        T2SyMRI = readNii(requireFile(paths.T2ref, pid, 'T2ref'));
+    else
+        % Signal-only cohort: no reference maps to compare against.
+        PDSyMRI = zeros(size(S1),'single');
+        T1SyMRI = zeros(size(S1),'single');
+        T2SyMRI = zeros(size(S1),'single');
+    end
 
-    filePDref = matchExisting(pdir, [config.filePDref, erase(config.filePDref,".gz")]);
-    fileT1ref = matchExisting(pdir, [config.fileT1ref, erase(config.fileT1ref,".gz")]);
-    fileT2ref = matchExisting(pdir, [config.fileT2ref, erase(config.fileT2ref,".gz")]);
-
-    fileMask  = matchExisting(pdir, ["mask.nii.gz","mask.nii"], true); % optional mask
-
-    S1  = readNii(fullfile(pdir,fileT1w));
-    infoRef = niftiinfo(fullfile(pdir,fileT1w));
-
-    S2  = readNii(fullfile(pdir,fileT2w));
-    S3  = readNii(fullfile(pdir,fileFLAIR));
-
-    PDSyMRI  = readNii(fullfile(pdir,filePDref));
-    T1SyMRI  = readNii(fullfile(pdir,fileT1ref));
-    T2SyMRI  = readNii(fullfile(pdir,fileT2ref));
-
-    if ~isempty(fileMask)
-        M = logical(readNii(fullfile(pdir,fileMask)));
+    if ~isempty(paths.mask) && isfile(paths.mask)
+        M = logical(readNii(paths.mask));
     else
         M = true(size(S1),'like',S1);
     end
@@ -173,21 +187,21 @@ for sel = 1:numel(predictIDs)
         'Input/mask sizes do not match for patient %s.', pid);
 
     assert(isequal(size(S1),size(PDSyMRI),size(T1SyMRI),size(T2SyMRI)), ...
-        'Input/reference qMRI map sizes do not match for patient %s.', pid);
+        ['Input/reference qMRI map sizes do not match for patient %s. Re-run ', ...
+         'preprocess_dicom_to_nifti.py with --resample and point ', ...
+         'config.processedRoot at the *_resampled dir.'], pid);
 
-    %% 5) Acquisition parameters for this patient
-    row = T(strcmp(strtrim(string(T.(idCol))), pid), :);
-    assert(~isempty(row),'Patient %s not found in Excel.', pid);
-
+    %% 5) Acquisition parameters (read from DICOM header; FA -> radians)
+    acq = readAcqParams(row, config);              % [TR/TE/FA(deg)/TI], 8-vector
     ACQ = zeros(8,1,'single');
-    ACQ(1) = single(row.(TRT1col));                % TR T1w
-    ACQ(2) = single(row.(TET1col));                % TE T1w
-    ACQ(3) = single(deg2rad(row.(FADcol)));        % FA in radians
-    ACQ(4) = single(row.(TRT2col));                % TR T2w
-    ACQ(5) = single(row.(TET2col));                % TE T2w
-    ACQ(6) = single(row.(TRFcol));                 % TR FLAIR
-    ACQ(7) = single(row.(TEFcol));                 % TE FLAIR
-    ACQ(8) = single(row.(TIFcol));                 % TI FLAIR
+    ACQ(1) = single(acq(1));                       % TR T1w
+    ACQ(2) = single(acq(2));                       % TE T1w
+    ACQ(3) = single(deg2rad(acq(3)));              % FA in radians
+    ACQ(4) = single(acq(4));                       % TR T2w
+    ACQ(5) = single(acq(5));                       % TE T2w
+    ACQ(6) = single(acq(6));                       % TR FLAIR
+    ACQ(7) = single(acq(7));                       % TE FLAIR
+    ACQ(8) = single(acq(8));                       % TI FLAIR
 
     %% 6) Raw inputs
     Xfull = cat(4, S1, S2, S3);                  % [Z Y X C]
@@ -307,7 +321,7 @@ for sel = 1:numel(predictIDs)
     else
         save(fullfile(savefolder,"TestLosses.mat"), ...
             "Lsig","Lpar","TestLoss","trainLoss","valLoss", ...
-            "modelMode","leftOutID","pid","savedir");
+            "modelMode","foldNum","pid","savedir");
     end
 
     %% Plotting and correlation
@@ -399,6 +413,167 @@ end % loop over selected patients
 
 
 %% ======================== HELPERS =========================
+
+function T = readCohortCSV(csvPath, config)
+% Read the anonymized MAGiC cohort CSV (schema: doc/fulldataset.md).
+% PHI-safe: only AnonymizationID + image-path + match_status are touched here.
+assert(isfile(csvPath), 'Cohort CSV not found: %s', csvPath);
+% Force the AnonymizationID column to text so zero-padded ids (e.g. "000") are
+% preserved and match the processed/<id> folders from the preprocessor.
+opts = detectImportOptions(csvPath, 'VariableNamingRule', 'preserve');
+hitId = find(strcmpi(opts.VariableNames, config.idCol), 1);
+if ~isempty(hitId)
+    opts = setvartype(opts, opts.VariableNames(hitId), 'char');
+end
+T = readtable(csvPath, opts);
+assert(any(strcmp(T.Properties.VariableNames, config.idCol)), ...
+    'CSV missing required ID column "%s".', config.idCol);
+
+if config.requireMatched && any(strcmpi(T.Properties.VariableNames, 'match_status'))
+    ms = string(T.(matchVar(T,'match_status')));
+    keep = ismember(lower(strtrim(ms)), ["matched","match","ok","valid","true","1"]);
+    if any(keep), T = T(keep, :);
+    else, warning('requireMatched is on but no rows matched a known match_status; keeping all rows.'); end
+end
+
+ids = string(T.(config.idCol));
+T   = T(~ismissing(ids) & strlength(strtrim(ids)) > 0, :);
+[~, ia] = unique(string(T.(config.idCol)), 'stable');
+T = T(ia, :);
+end
+
+
+function paths = resolvePatientFiles(row, config)
+% Resolve one patient's NIfTI paths under <processedRoot>/<AnonymizationID>/
+% (produced by preprocess_dicom_to_nifti.py). Missing files keep their canonical
+% path so requireFile() can report them by AnonymizationID.
+pid  = canonId(row.(config.idCol));
+pdir = fullfile(char(config.processedRoot), char(pid));
+paths.T1w   = underProcessed(pdir, config.fileT1w);
+paths.T2w   = underProcessed(pdir, config.fileT2w);
+paths.FLAIR = underProcessed(pdir, config.fileFLAIR);
+paths.PDref = underProcessed(pdir, config.filePDref);
+paths.T1ref = underProcessed(pdir, config.fileT1ref);
+paths.T2ref = underProcessed(pdir, config.fileT2ref);
+paths.mask  = underProcessed(pdir, config.fileMask);
+end
+
+
+function p = underProcessed(pdir, name)
+% Existing file at pdir/name (trying .nii/.nii.gz); else the canonical path.
+p = resolveExt(fullfile(pdir, char(name)));
+if isempty(p), p = fullfile(pdir, char(name)); end
+end
+
+
+function s = canonId(v)
+% Canonical AnonymizationID string matching the Python 'processed/<id>' folders:
+% integer-valued IDs render without a decimal (0 -> "0", 5 -> "5").
+if iscell(v), v = v{1}; end
+if isnumeric(v)
+    if isscalar(v) && v == floor(v)
+        s = string(int64(v));
+    else
+        s = string(v);
+    end
+else
+    s = strtrim(string(v));
+end
+end
+
+
+function out = resolveExt(pathIn)
+% Return an existing file trying pathIn, +.gz, and -.gz. '' if none.
+out = '';
+cands = string(pathIn);
+if endsWith(pathIn, ".gz")
+    cands(end+1) = erase(string(pathIn), ".gz");
+elseif endsWith(pathIn, ".nii")
+    cands(end+1) = string(pathIn) + ".gz";
+end
+for i = 1:numel(cands)
+    if isfile(cands(i)), out = char(cands(i)); return; end
+end
+end
+
+
+function name = matchVar(T, candidate)
+% Case-insensitive lookup of a single column name; "" if absent.
+name = "";
+hit = find(strcmpi(T.Properties.VariableNames, candidate), 1);
+if ~isempty(hit), name = string(T.Properties.VariableNames{hit}); end
+end
+
+
+function acq = readAcqParams(row, config)
+% Read the MAGiC acquisition parameters for one patient from the NIfTI header
+% 'descrip' fields stamped by preprocess_dicom_to_nifti.py. Returns
+% [TRT1 TET1 FAT1_deg TRT2 TET2 TRFLAIR TEFLAIR TIFLAIR] with FA in DEGREES
+% (callers convert to radians). config.acq positive entries are the fallback for
+% any tag a header lacks; unresolved values -> fail fast (AnonymizationID only).
+pid  = canonId(row.(config.idCol));
+pdir = fullfile(char(config.processedRoot), char(pid));
+
+d1 = niiDescrip(underProcessed(pdir, config.fileT1w));    % TR;TE;FA
+d2 = niiDescrip(underProcessed(pdir, config.fileT2w));    % TR;TE
+d3 = niiDescrip(underProcessed(pdir, config.fileFLAIR));  % TR;TE;TI
+
+fb = zeros(1,8);
+if isfield(config,'acq') && numel(config.acq)==8, fb = double(config.acq(:)'); end
+
+acq    = zeros(1,8);
+acq(1) = parseTag(d1, 'TR', fb(1));
+acq(2) = parseTag(d1, 'TE', fb(2));
+acq(3) = parseTag(d1, 'FA', fb(3));
+acq(4) = parseTag(d2, 'TR', fb(4));
+acq(5) = parseTag(d2, 'TE', fb(5));
+acq(6) = parseTag(d3, 'TR', fb(6));
+acq(7) = parseTag(d3, 'TE', fb(7));
+acq(8) = parseTag(d3, 'TI', fb(8));
+
+miss = find(~(acq > 0));
+if ~isempty(miss)
+    names = ["TRT1","TET1","FAT1_deg","TRT2","TET2","TRFLAIR","TEFLAIR","TIFLAIR"];
+    error('qMRI:AcqParam', ...
+        'Could not resolve acquisition parameter(s) %s from NIfTI header for patient %s.', ...
+        strjoin(cellstr(names(miss)), ', '), pid);
+end
+end
+
+
+function s = niiDescrip(f)
+% NIfTI header 'descrip' string (MATLAB exposes it as info.Description); "" if
+% the file is missing or unreadable.
+s = "";
+if isfile(f)
+    try, info = niftiinfo(f); s = string(info.Description); catch, end
+end
+end
+
+
+function v = parseTag(descrip, key, fallback)
+% Parse "<key>=<number>" out of a 'TR=..;TE=..;FA=..;TI=..' descrip string.
+% Falls back to a positive fallback value when the key is absent.
+v = 0;
+if strlength(descrip) > 0
+    tok = regexp(descrip, key + "\s*=\s*([-\d.eE+]+)", 'tokens', 'once');
+    if ~isempty(tok), v = str2double(tok{1}); end
+end
+if ~(v > 0) && nargin >= 3 && ~isempty(fallback) && fallback > 0
+    v = double(fallback);
+end
+end
+
+
+function p = requireFile(pathIn, anonID, tag)
+% Fail-fast gate (mirrors radpathsandbox/validate_data_files.py). Identifies the
+% file by AnonymizationID + contrast tag ONLY -- never a PHI path fragment.
+if isempty(pathIn) || ~isfile(pathIn)
+    error('qMRI:MissingFile', 'Required %s file for patient %s not found.', tag, anonID);
+end
+p = pathIn;
+end
+
 
 function name = getLastFolderName(pathstr)
 pathstr = char(pathstr);
